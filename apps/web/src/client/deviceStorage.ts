@@ -57,6 +57,16 @@ export class DeviceStorage {
     db: IDBDatabase | null = null;
     private serialQueue = new AsyncQueue();
 
+    private resetDb(): void {
+        try {
+            this.db?.close();
+        }
+        catch {
+            // Ignore close errors
+        }
+        this.db = null;
+    }
+
     private async ensureInit(): Promise<void> {
         if (!this.db) {
             await this.init();
@@ -70,6 +80,15 @@ export class DeviceStorage {
             request.onerror = () => reject(request.error);
             request.onsuccess = () => {
                 this.db = request.result;
+
+                this.db.onclose = () => {
+                    this.db = null;
+                };
+
+                this.db.onversionchange = () => {
+                    this.resetDb();
+                };
+
                 resolve();
             };
 
@@ -100,14 +119,28 @@ export class DeviceStorage {
     ): Promise<T> {
         await this.ensureInit();
 
-        return new Promise((resolve, reject) => {
-            const transaction = this.db!.transaction(storeNames, mode);
-            const store = transaction.objectStore(storeNames[0]);
-            const request = operation(store);
+        const run = (): Promise<T> => new Promise((resolve, reject) => {
+            const tx = this.db!.transaction(storeNames, mode);
+            const store = tx.objectStore(storeNames[0]);
+            const req = operation(store);
 
-            request.onerror = () => reject(request.error);
-            request.onsuccess = () => resolve(request.result);
+            tx.onabort = () => reject(tx.error ?? new Error("IDB transaction aborted"));
+            tx.onerror = () => reject(tx.error ?? new Error("IDB transaction error"));
+            tx.oncomplete = () => resolve(req.result as T);
+            req.onerror = () => reject(req.error);
         });
+
+        try {
+            return await run();
+        }
+        catch (e: unknown) {
+            if (e instanceof DOMException && e.name === "InvalidStateError") {
+                this.resetDb();
+                await this.ensureInit();
+                return await run();
+            }
+            throw e;
+        }
     }
 
     private async operation<T>(block: () => Promise<T>) {
